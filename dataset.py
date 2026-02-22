@@ -70,7 +70,12 @@ def build_dataset(
     Build tf.data pipeline for FSDiT training.
 
     Returns:
-        dataset: yields {'target': (B,H,W,3), 'supports': (B,5,H,W,3), 'class_id': (B,)}
+        dataset: yields {
+            'target': (B,H,W,3),
+            'supports_seq': (B,5,196,768),
+            'supports_pooled': (B,5,768),
+            'class_id': (B,)
+        }
         class_names: list of class names
     """
     episodes, class_names = build_episode_table(data_dir, num_sets, seed)
@@ -104,11 +109,39 @@ def build_dataset(
             img = tf.cast(img, tf.float32) / 255.0
             return (img - 0.5) / 0.5  # → [-1, 1]
 
+        def read_npz(path_tensor):
+            path_str = path_tensor.numpy().decode('utf-8')
+            npz_path = os.path.splitext(path_str)[0] + '.npz'
+            if not os.path.exists(npz_path):
+                raise FileNotFoundError(f"Missing precomputed embedding: {npz_path}")
+            data = np.load(npz_path)
+            return data['seq'].astype(np.float32), data['pooled'].astype(np.float32)
+
+        def map_npz(path):
+            seq, pooled = tf.py_function(read_npz, [path], [tf.float32, tf.float32])
+            seq.set_shape([196, 768])
+            pooled.set_shape([768])
+            return seq, pooled
+
         target = read_img(target_path)
         if is_train:
             target = tf.image.random_flip_left_right(target)
-        supports = tf.map_fn(read_img, support_paths, fn_output_signature=tf.float32)
-        return {'target': target, 'supports': supports, 'class_id': class_id}
+
+        supports_seq, supports_pooled = tf.map_fn(
+            map_npz,
+            support_paths,
+            fn_output_signature=(
+                tf.TensorSpec([196, 768], tf.float32),
+                tf.TensorSpec([768], tf.float32),
+            ),
+        )
+
+        return {
+            'target': target,
+            'supports_seq': supports_seq,
+            'supports_pooled': supports_pooled,
+            'class_id': class_id,
+        }
 
     ds = ds.map(load_sample, num_parallel_calls=tf.data.AUTOTUNE)
     ds = ds.repeat()

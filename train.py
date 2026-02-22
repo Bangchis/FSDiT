@@ -1,7 +1,7 @@
 """
 train.py — FSDiT: Few-Shot Diffusion Transformer Training.
 
-Flow-matching DiT conditioned on SigLIP2 support-set embeddings.
+Flow-matching DiT conditioned on precomputed SigLIP2 support embeddings.
 Data: miniImageNet (60 train / 16 val classes, 600 imgs each).
 Episodes: 100 sets/class × 6 rotations → 1 target + 5 support.
 
@@ -34,7 +34,6 @@ import matplotlib.pyplot as plt
 
 from model import DiT
 from dataset import build_dataset
-from encoder import SigLIP2Encoder
 from utils.train_state import TrainState, target_update
 from utils.checkpoint import Checkpoint
 from utils.stable_vae import StableVAE
@@ -51,7 +50,6 @@ flags.DEFINE_string('data_dir', '/kaggle/input/datasets/arjunashok33/miniimagene
 flags.DEFINE_string('load_dir', None,  'Resume from checkpoint.')
 flags.DEFINE_string('save_dir', None,  'Save checkpoints here.')
 flags.DEFINE_string('fid_stats', None, 'Precomputed FID stats .npz.')
-flags.DEFINE_string('siglip_ckpt', None, 'SigLIP2 .npz path (auto-download if None).')
 # Training
 flags.DEFINE_integer('seed', np.random.choice(1000000), 'Random seed.')
 flags.DEFINE_integer('batch_size', 128, 'Global batch size.')
@@ -148,7 +146,7 @@ class Trainer(flax.struct.PyTreeNode):
 
     # ── Training step ──────────────────────────────────────────────────────
     @partial(jax.pmap, axis_name='data')
-    def train_step(self, images, support_embed):
+    def train_step(self, images, support_pooled, support_seq):
         """One training step. Returns (new_trainer, info_dict)."""
         new_rng, cond_key, time_key, noise_key = jax.random.split(self.rng, 4)
         num_bins = self.config['num_t_bins']
@@ -164,7 +162,7 @@ class Trainer(flax.struct.PyTreeNode):
             x_t = flow_interpolate(images, eps, t[:, None, None, None])
             v_gt = flow_velocity(images, eps)
             v_pred = self.model(
-                x_t, t, support_embed, train=True,
+                x_t, t, support_pooled, y_seq=support_seq, train=True,
                 rngs={'cond_dropout': cond_key}, params=params,
             )
             mse = (v_pred - v_gt) ** 2
@@ -202,7 +200,7 @@ class Trainer(flax.struct.PyTreeNode):
 
     # ── Validation loss ────────────────────────────────────────────────────
     @partial(jax.pmap, axis_name='data')
-    def val_loss(self, images, support_embed):
+    def val_loss(self, images, support_pooled, support_seq):
         """Compute val loss + t-bin breakdown (no dropout, uses EMA model)."""
         time_key, noise_key = jax.random.split(self.rng, 2)
         if self.config['t_sampler'] == 'log-normal':
@@ -213,7 +211,10 @@ class Trainer(flax.struct.PyTreeNode):
         eps = jax.random.normal(noise_key, images.shape)
         x_t = flow_interpolate(images, eps, t[:, None, None, None])
         v_gt = flow_velocity(images, eps)
-        v_pred = self.model_ema(x_t, t, support_embed, train=False, force_drop_ids=False)
+        v_pred = self.model_ema(
+            x_t, t, support_pooled, y_seq=support_seq,
+            train=False, force_drop_ids=False,
+        )
         mse = jnp.mean((v_pred - v_gt) ** 2, axis=(1, 2, 3))
         loss = jnp.mean(mse)
         tbin = compute_t_bin_losses(mse, t, self.config['num_t_bins'])
@@ -221,7 +222,7 @@ class Trainer(flax.struct.PyTreeNode):
 
     # ── Attention entropy ──────────────────────────────────────────────────
     @partial(jax.pmap, axis_name='data')
-    def get_attn_entropy(self, images, support_embed):
+    def get_attn_entropy(self, images, support_pooled, support_seq):
         """Returns (depth, num_heads) entropy matrix and (B,) timesteps."""
         time_key, noise_key = jax.random.split(self.rng, 2)
         if self.config['t_sampler'] == 'log-normal':
@@ -232,22 +233,28 @@ class Trainer(flax.struct.PyTreeNode):
         x_t = flow_interpolate(images, eps, t[:, None, None, None])
 
         _, attn_list = self.model_ema(
-            x_t, t, support_embed, train=False, force_drop_ids=False, return_attn=True)
+            x_t, t, support_pooled, y_seq=support_seq,
+            train=False, force_drop_ids=False, return_attn=True,
+        )
         entropies = jnp.stack([attention_entropy(aw) for aw in attn_list])  # (depth, H)
         return entropies, t
 
     # ── CFG sampling ───────────────────────────────────────────────────────
     @partial(jax.pmap, axis_name='data',
-             in_axes=(0, 0, 0, 0), static_broadcasted_argnums=(4, 5))
-    def sample_step(self, x, t_vec, support_embed, cfg=True, cfg_val=1.0):
+             in_axes=(0, 0, 0, 0, 0), static_broadcasted_argnums=(5, 6))
+    def sample_step(self, x, t_vec, support_pooled, support_seq, cfg=True, cfg_val=1.0):
         """One Euler step with optional CFG."""
         if not cfg or cfg_val == 0:
-            return self.model_ema(x, t_vec, support_embed, train=False, force_drop_ids=False)
+            return self.model_ema(
+                x, t_vec, support_pooled, y_seq=support_seq,
+                train=False, force_drop_ids=False,
+            )
         B = x.shape[0]
         x2 = jnp.concatenate([x, x])
         t2 = jnp.concatenate([t_vec, t_vec])
-        s2 = jnp.concatenate([support_embed, jnp.zeros_like(support_embed)])
-        v = self.model_ema(x2, t2, s2, train=False, force_drop_ids=False)
+        pooled2 = jnp.concatenate([support_pooled, jnp.zeros_like(support_pooled)])
+        seq2 = jnp.concatenate([support_seq, jnp.zeros_like(support_seq)])
+        v = self.model_ema(x2, t2, pooled2, y_seq=seq2, train=False, force_drop_ids=False)
         v_c, v_u = v[:B], v[B:]
         return v_u + cfg_val * (v_c - v_u)
 
@@ -286,10 +293,8 @@ def main(_):
 
     example = next(train_iter)
     example_img = example['target'][:1]  # (1, 224, 224, 3)
-
-    # ── SigLIP2 (frozen) ──────────────────────────────────────────────────
-    print("Loading SigLIP2 B/16 224×224...")
-    siglip = SigLIP2Encoder.create(ckpt_path=FLAGS.siglip_ckpt, variant='B/16', res=224)
+    example_sup_seq = example['supports_seq'][:1]  # (1, 5, 196, 768)
+    n_sup_tokens = example_sup_seq.shape[1] * example_sup_seq.shape[2]
 
     # ── VAE (optional) ────────────────────────────────────────────────────
     if cfg.use_vae:
@@ -316,7 +321,8 @@ def main(_):
         {'params': p_key, 'cond_dropout': d_key},
         jnp.zeros((1, img_s, img_s, img_c)),   # x
         jnp.zeros((1,)),                         # t
-        jnp.zeros((1, cfg.siglip_dim)),          # y (support embed)
+        jnp.zeros((1, cfg.siglip_dim)),          # y_pooled
+        jnp.zeros((1, n_sup_tokens, cfg.siglip_dim)),  # y_seq
     )['params']
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
     print(f"DiT parameters: {n_params:,}")
@@ -352,24 +358,24 @@ def main(_):
             img = vae_decode(img[None])[0]
         return np.array(jnp.clip(img * 0.5 + 0.5, 0, 1))
 
-    def encode_supports(batch_supports):
-        """(B, 5, 224, 224, 3) → (B, siglip_dim)."""
-        return siglip.encode_supports(batch_supports)
-
     # ── Eval function ─────────────────────────────────────────────────────
     def run_eval(step):
         val_batch = next(val_iter)
         val_img = val_batch['target']
-        val_sup = encode_supports(val_batch['supports'])
+        val_sup_seq = val_batch['supports_seq'].reshape(
+            val_batch['supports_seq'].shape[0], -1, val_batch['supports_seq'].shape[-1]
+        )
+        val_sup_pooled = np.mean(val_batch['supports_pooled'], axis=1)
 
         # Reshape for pmap
         val_img = val_img.reshape(n_dev, -1, *val_img.shape[1:])
-        val_sup = val_sup.reshape(n_dev, -1, *val_sup.shape[1:])
+        val_sup_seq = val_sup_seq.reshape(n_dev, -1, *val_sup_seq.shape[1:])
+        val_sup_pooled = val_sup_pooled.reshape(n_dev, -1, val_sup_pooled.shape[-1])
         if cfg.use_vae:
             val_img = vae_encode(vae_rng, val_img)
 
         # Val loss
-        v_loss, v_tbin = trainer.val_loss(val_img, val_sup)
+        v_loss, v_tbin = trainer.val_loss(val_img, val_sup_pooled, val_sup_seq)
         v_loss_f = float(np.array(v_loss).mean())
         v_tbin_f = np.array(v_tbin).mean(axis=0)
 
@@ -382,7 +388,7 @@ def main(_):
 
         # Attention entropy
         try:
-            ent_matrix, _ = trainer.get_attn_entropy(val_img, val_sup)
+            ent_matrix, _ = trainer.get_attn_entropy(val_img, val_sup_pooled, val_sup_seq)
             ent = np.array(ent_matrix).mean(axis=0)  # avg devices → (depth, H)
             if jax.process_index() == 0:
                 depth = cfg.depth
@@ -397,14 +403,15 @@ def main(_):
 
         # Sample grid
         if jax.process_index() == 0:
-            _generate_samples(step, val_sup)
+            _generate_samples(step, val_sup_pooled, val_sup_seq)
 
-        del val_img, val_sup
+        del val_img, val_sup_pooled, val_sup_seq
         print(f"Eval done @ step {step}")
 
-    def _generate_samples(step, sup_pmap):
+    def _generate_samples(step, sup_pooled_pmap, sup_seq_pmap):
         """Generate images with Euler sampling + CFG."""
-        sup_viz = sup_pmap[:, :1]  # (ndev, 1, dim)
+        sup_pooled_viz = sup_pooled_pmap[:, :1]  # (ndev, 1, dim)
+        sup_seq_viz = sup_seq_pmap[:, :1]        # (ndev, 1, T, dim)
         key = jax.random.PRNGKey(42 + step)
         shape = (n_dev, 1, img_s, img_s, img_c)
         eps = jax.random.normal(key, shape)
@@ -414,7 +421,9 @@ def main(_):
             x = eps
             for ti in range(cfg.denoise_steps):
                 t_vec = jnp.full((n_dev, 1), ti / cfg.denoise_steps)
-                x = x + trainer.sample_step(x, t_vec, sup_viz, True, cfg_val) * dt
+                x = x + trainer.sample_step(
+                    x, t_vec, sup_pooled_viz, sup_seq_viz, True, cfg_val
+                ) * dt
 
             fig, axs = plt.subplots(1, min(n_dev, 8), figsize=(24, 4))
             if not hasattr(axs, '__len__'):
@@ -442,14 +451,18 @@ def main(_):
         if not FLAGS.debug_overfit or step == 1:
             batch = next(train_iter)
             imgs = batch['target']
-            sup = encode_supports(batch['supports'])
+            sup_seq = batch['supports_seq'].reshape(
+                batch['supports_seq'].shape[0], -1, batch['supports_seq'].shape[-1]
+            )
+            sup_pooled = np.mean(batch['supports_pooled'], axis=1)
             imgs = imgs.reshape(n_dev, -1, *imgs.shape[1:])
-            sup = sup.reshape(n_dev, -1, *sup.shape[1:])
+            sup_seq = sup_seq.reshape(n_dev, -1, *sup_seq.shape[1:])
+            sup_pooled = sup_pooled.reshape(n_dev, -1, sup_pooled.shape[-1])
             if cfg.use_vae:
                 imgs = vae_encode(vae_rng, imgs)
 
         # ── Train step ──
-        trainer, info = trainer.train_step(imgs, sup)
+        trainer, info = trainer.train_step(imgs, sup_pooled, sup_seq)
         dt_step = time.time() - t0
 
         # ── Log ──

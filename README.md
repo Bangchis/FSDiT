@@ -1,12 +1,15 @@
 # FSDiT — Few-Shot Diffusion Transformer
 
-Flow-matching DiT conditioned on **SigLIP2 support-set embeddings** for few-shot image generation on miniImageNet.
+Flow-matching DiT conditioned on **precomputed SigLIP2 support embeddings** (pooled + token sequence)
+for few-shot image generation on miniImageNet.
 
 ## Architecture
 
 ```
-5 Support Images → [SigLIP2 B/16 frozen] → mean pool → MLP → FiLM
-Target Image     → [SD VAE]              → latent     → DiT (adaLN-Zero) → v_pred
+5 Support Images → precompute `.npz` (seq[196,768], pooled[768])
+pooled → MLP → adaLN condition
+seq    → OneLayerPerceiver → Cross-Attn context
+Target Image → [SD VAE] → latent → DiT (adaLN-Zero + cross-attn) → v_pred
 ```
 
 ## Project Structure
@@ -17,6 +20,7 @@ FSDiT/
 ├── model.py          # DiT architecture + SupportProjector
 ├── dataset.py        # miniImageNet episode loader
 ├── encoder.py        # Frozen SigLIP2 B/16 encoder
+├── precompute_siglip_debug.py  # Precompute seq/pooled embeddings to .npz
 └── utils/
     ├── train_state.py
     ├── checkpoint.py
@@ -40,7 +44,12 @@ import os; os.chdir('/kaggle/working/FSDiT')
     --dst /kaggle/working/miniimagenet \
     --train 60 --val 16 --test 20
 
-# Cell 3: Train
+# Cell 3: Precompute SigLIP2 embeddings
+!python precompute_siglip_debug.py \
+    --data_dir /kaggle/working/miniimagenet \
+    --dtype float16
+
+# Cell 4: Train
 !python train.py \
     --data_dir /kaggle/working/miniimagenet \
     --save_dir /kaggle/working/ckpts \
@@ -67,6 +76,9 @@ import os; os.chdir('/kaggle/working/FSDiT')
 - 60 train / 16 val / 20 test classes, 600 images/class
 - 100 sets/class × 6 images/set × 6 rotations = **36,000 episodes**
 - Each episode: 1 target + 5 support, stratified batching
+- For each support image, a sidecar `.npz` file is required with:
+  - `seq`: `(196, 768)` (SigLIP2 patch tokens)
+  - `pooled`: `(768,)` (SigLIP2 pooled embedding)
 
 ## WandB Dashboard
 
