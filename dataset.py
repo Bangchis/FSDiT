@@ -64,7 +64,7 @@ def _interleave_by_class(episodes, num_classes, seed):
 
 def build_dataset(
     data_dir, batch_size, image_size=224, num_sets=100,
-    is_train=True, seed=42, debug_n=0, embedding_root=None,
+    is_train=True, seed=42, debug_n=0, embedding_root=None, load_support_seq=True,
 ):
     """
     Build tf.data pipeline for FSDiT training.
@@ -109,36 +109,40 @@ def build_dataset(
             img = tf.cast(img, tf.float32) / 255.0
             return (img - 0.5) / 0.5  # → [-1, 1]
 
-        def read_npz(path_tensor):
-            path_str = path_tensor.numpy().decode('utf-8')
-            if embedding_root:
-                rel = os.path.relpath(path_str, data_dir)
-                npz_path = os.path.join(embedding_root, os.path.splitext(rel)[0] + '.npz')
-            else:
-                npz_path = os.path.splitext(path_str)[0] + '.npz'
-            if not os.path.exists(npz_path):
-                raise FileNotFoundError(f"Missing precomputed embedding: {npz_path}")
-            data = np.load(npz_path)
-            return data['seq'].astype(np.float32), data['pooled'].astype(np.float32)
-
-        def map_npz(path):
-            seq, pooled = tf.py_function(read_npz, [path], [tf.float32, tf.float32])
-            seq.set_shape([196, 768])
-            pooled.set_shape([768])
-            return seq, pooled
+        def read_support_npzs(paths_tensor):
+            paths = paths_tensor.numpy()
+            seq_list = []
+            pooled_list = []
+            for raw in paths:
+                path_str = raw.decode('utf-8')
+                if embedding_root:
+                    rel = os.path.relpath(path_str, data_dir)
+                    npz_path = os.path.join(embedding_root, os.path.splitext(rel)[0] + '.npz')
+                else:
+                    npz_path = os.path.splitext(path_str)[0] + '.npz'
+                if not os.path.exists(npz_path):
+                    raise FileNotFoundError(f"Missing precomputed embedding: {npz_path}")
+                data = np.load(npz_path)
+                if load_support_seq:
+                    seq = data['seq'].astype(np.float16)
+                else:
+                    seq = np.zeros((196, 768), dtype=np.float16)
+                pooled = data['pooled'].astype(np.float16)
+                seq_list.append(seq)
+                pooled_list.append(pooled)
+            return np.stack(seq_list, axis=0), np.stack(pooled_list, axis=0)
 
         target = read_img(target_path)
         if is_train:
             target = tf.image.random_flip_left_right(target)
 
-        supports_seq, supports_pooled = tf.map_fn(
-            map_npz,
-            support_paths,
-            fn_output_signature=(
-                tf.TensorSpec([196, 768], tf.float32),
-                tf.TensorSpec([768], tf.float32),
-            ),
+        supports_seq, supports_pooled = tf.py_function(
+            read_support_npzs,
+            [support_paths],
+            [tf.float16, tf.float16],
         )
+        supports_seq.set_shape([5, 196, 768])
+        supports_pooled.set_shape([5, 768])
 
         return {
             'target': target,
@@ -148,6 +152,10 @@ def build_dataset(
         }
 
     ds = ds.map(load_sample, num_parallel_calls=tf.data.AUTOTUNE)
+    if is_train:
+        options = tf.data.Options()
+        options.experimental_deterministic = False
+        ds = ds.with_options(options)
     ds = ds.repeat()
     if not debug_n:
         ds = ds.shuffle(min(len(episodes), n_cls * 50), seed=seed, reshuffle_each_iteration=True)

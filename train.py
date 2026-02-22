@@ -14,6 +14,7 @@ Usage (Kaggle TPU v5e-8):
 from typing import Any
 import os
 import time
+import warnings
 from absl import app, flags
 from functools import partial
 import numpy as np
@@ -58,11 +59,14 @@ flags.DEFINE_integer('batch_size', 128, 'Global batch size.')
 flags.DEFINE_integer('max_steps', 200_000, 'Total training steps.')
 flags.DEFINE_integer('num_sets', 100, 'Sets per class (each set = 6 images).')
 flags.DEFINE_integer('debug_overfit', 0, 'Overfit on N samples (0 = off).')
+flags.DEFINE_bool('use_support_seq', True, 'Use support sequence context for cross-attention.')
+flags.DEFINE_bool('suppress_diffusers_warnings', True, 'Suppress repeated diffusers Flax deprecation warnings.')
 # Logging
 flags.DEFINE_integer('log_interval', 500, 'Train metric logging interval.')
 flags.DEFINE_integer('eval_interval', 5000, 'Validation + attention entropy interval.')
 flags.DEFINE_integer('fid_interval', 25000, 'FID / sample grid interval.')
 flags.DEFINE_integer('save_interval', 25000, 'Checkpoint interval.')
+flags.DEFINE_integer('perf_log_interval', 100, 'Performance timing logging interval.')
 
 model_config = ml_collections.ConfigDict({
     # ── Optimizer ──
@@ -93,6 +97,7 @@ model_config = ml_collections.ConfigDict({
     'image_size': 224,
     'loss_ema_alpha': 0.99,  # EMA smoothing for logged train loss
     'num_t_bins': 10,        # t-bin resolution for loss breakdown
+    'use_support_seq': 1,    # whether to use support sequence context
 })
 
 PRESETS = {
@@ -163,8 +168,10 @@ class Trainer(flax.struct.PyTreeNode):
             eps = jax.random.normal(noise_key, images.shape)
             x_t = flow_interpolate(images, eps, t[:, None, None, None])
             v_gt = flow_velocity(images, eps)
+            sup_pooled = support_pooled.astype(images.dtype)
+            sup_seq = support_seq.astype(images.dtype) if self.config.get('use_support_seq', 1) else None
             v_pred = self.model(
-                x_t, t, support_pooled, y_seq=support_seq, train=True,
+                x_t, t, sup_pooled, y_seq=sup_seq, train=True,
                 rngs={'cond_dropout': cond_key}, params=params,
             )
             mse = (v_pred - v_gt) ** 2
@@ -213,8 +220,10 @@ class Trainer(flax.struct.PyTreeNode):
         eps = jax.random.normal(noise_key, images.shape)
         x_t = flow_interpolate(images, eps, t[:, None, None, None])
         v_gt = flow_velocity(images, eps)
+        sup_pooled = support_pooled.astype(images.dtype)
+        sup_seq = support_seq.astype(images.dtype) if self.config.get('use_support_seq', 1) else None
         v_pred = self.model_ema(
-            x_t, t, support_pooled, y_seq=support_seq,
+            x_t, t, sup_pooled, y_seq=sup_seq,
             train=False, force_drop_ids=False,
         )
         mse = jnp.mean((v_pred - v_gt) ** 2, axis=(1, 2, 3))
@@ -233,9 +242,11 @@ class Trainer(flax.struct.PyTreeNode):
             t = jax.random.uniform(time_key, (images.shape[0],))
         eps = jax.random.normal(noise_key, images.shape)
         x_t = flow_interpolate(images, eps, t[:, None, None, None])
+        sup_pooled = support_pooled.astype(images.dtype)
+        sup_seq = support_seq.astype(images.dtype) if self.config.get('use_support_seq', 1) else None
 
         _, attn_list = self.model_ema(
-            x_t, t, support_pooled, y_seq=support_seq,
+            x_t, t, sup_pooled, y_seq=sup_seq,
             train=False, force_drop_ids=False, return_attn=True,
         )
         entropies = jnp.stack([attention_entropy(aw) for aw in attn_list])  # (depth, H)
@@ -246,16 +257,22 @@ class Trainer(flax.struct.PyTreeNode):
              in_axes=(0, 0, 0, 0, 0), static_broadcasted_argnums=(5, 6))
     def sample_step(self, x, t_vec, support_pooled, support_seq, cfg=True, cfg_val=1.0):
         """One Euler step with optional CFG."""
+        sup_pooled = support_pooled.astype(x.dtype)
+        use_seq = self.config.get('use_support_seq', 1)
+        sup_seq = support_seq.astype(x.dtype) if use_seq else None
         if not cfg or cfg_val == 0:
             return self.model_ema(
-                x, t_vec, support_pooled, y_seq=support_seq,
+                x, t_vec, sup_pooled, y_seq=sup_seq,
                 train=False, force_drop_ids=False,
             )
         B = x.shape[0]
         x2 = jnp.concatenate([x, x])
         t2 = jnp.concatenate([t_vec, t_vec])
-        pooled2 = jnp.concatenate([support_pooled, jnp.zeros_like(support_pooled)])
-        seq2 = jnp.concatenate([support_seq, jnp.zeros_like(support_seq)])
+        pooled2 = jnp.concatenate([sup_pooled, jnp.zeros_like(sup_pooled)])
+        if use_seq:
+            seq2 = jnp.concatenate([sup_seq, jnp.zeros_like(sup_seq)])
+        else:
+            seq2 = None
         v = self.model_ema(x2, t2, pooled2, y_seq=seq2, train=False, force_drop_ids=False)
         v_c, v_u = v[:B], v[B:]
         return v_u + cfg_val * (v_c - v_u)
@@ -269,6 +286,13 @@ def main(_):
     cfg = FLAGS.model
     for k, v in PRESETS[cfg.preset].items():
         cfg[k] = v
+    cfg.use_support_seq = int(FLAGS.use_support_seq)
+
+    if FLAGS.suppress_diffusers_warnings:
+        warnings.filterwarnings(
+            "ignore",
+            message=".*Flax classes are deprecated and will be removed in Diffusers.*",
+        )
 
     np.random.seed(FLAGS.seed)
     devices = jax.local_devices()
@@ -290,12 +314,14 @@ def main(_):
         image_size=cfg.image_size, num_sets=FLAGS.num_sets,
         is_train=True, seed=FLAGS.seed, debug_n=FLAGS.debug_overfit,
         embedding_root=train_emb_dir,
+        load_support_seq=FLAGS.use_support_seq,
     )
     val_ds, _ = build_dataset(
         os.path.join(FLAGS.data_dir, 'val'), local_bs,
         image_size=cfg.image_size, num_sets=FLAGS.num_sets,
         is_train=False, seed=FLAGS.seed + 1000,
         embedding_root=val_emb_dir,
+        load_support_seq=FLAGS.use_support_seq,
     )
     train_iter = iter(train_ds.as_numpy_iterator())
     val_iter = iter(val_ds.as_numpy_iterator())
@@ -371,10 +397,20 @@ def main(_):
     def run_eval(step):
         val_batch = next(val_iter)
         val_img = val_batch['target']
-        val_sup_seq = val_batch['supports_seq'].reshape(
-            val_batch['supports_seq'].shape[0], -1, val_batch['supports_seq'].shape[-1]
-        )
-        val_sup_pooled = np.mean(val_batch['supports_pooled'], axis=1)
+        val_sup_pooled = np.mean(
+            val_batch['supports_pooled'],
+            axis=1,
+            dtype=np.float32,
+        ).astype(np.float16)
+        if FLAGS.use_support_seq:
+            val_sup_seq = val_batch['supports_seq'].reshape(
+                val_batch['supports_seq'].shape[0], -1, val_batch['supports_seq'].shape[-1]
+            )
+        else:
+            val_sup_seq = np.zeros(
+                (val_batch['target'].shape[0], 1, cfg.siglip_dim),
+                dtype=np.float16,
+            )
 
         # Reshape for pmap
         val_img = val_img.reshape(n_dev, -1, *val_img.shape[1:])
@@ -454,25 +490,40 @@ def main(_):
 
     alpha = cfg.loss_ema_alpha
     for step in tqdm.tqdm(range(1, FLAGS.max_steps + 1), smoothing=0.1, dynamic_ncols=True):
-        t0 = time.time()
+        iter_t0 = time.time()
+        data_time = 0.0
+        vae_time = 0.0
 
         # ── Get batch ──
         if not FLAGS.debug_overfit or step == 1:
+            t_data0 = time.time()
             batch = next(train_iter)
             imgs = batch['target']
-            sup_seq = batch['supports_seq'].reshape(
-                batch['supports_seq'].shape[0], -1, batch['supports_seq'].shape[-1]
-            )
-            sup_pooled = np.mean(batch['supports_pooled'], axis=1)
+            sup_pooled = np.mean(
+                batch['supports_pooled'],
+                axis=1,
+                dtype=np.float32,
+            ).astype(np.float16)
+            if FLAGS.use_support_seq:
+                sup_seq = batch['supports_seq'].reshape(
+                    batch['supports_seq'].shape[0], -1, batch['supports_seq'].shape[-1]
+                )
+            else:
+                sup_seq = np.zeros((batch['target'].shape[0], 1, cfg.siglip_dim), dtype=np.float16)
             imgs = imgs.reshape(n_dev, -1, *imgs.shape[1:])
             sup_seq = sup_seq.reshape(n_dev, -1, *sup_seq.shape[1:])
             sup_pooled = sup_pooled.reshape(n_dev, -1, sup_pooled.shape[-1])
+            data_time = time.time() - t_data0
             if cfg.use_vae:
+                t_vae0 = time.time()
                 imgs = vae_encode(vae_rng, imgs)
+                vae_time = time.time() - t_vae0
 
         # ── Train step ──
+        t_step0 = time.time()
         trainer, info = trainer.train_step(imgs, sup_pooled, sup_seq)
-        dt_step = time.time() - t0
+        step_time = time.time() - t_step0
+        dt_step = time.time() - iter_t0
 
         # ── Log ──
         if step % FLAGS.log_interval == 0 and jax.process_index() == 0:
@@ -494,6 +545,14 @@ def main(_):
             for b in range(cfg.num_t_bins):
                 log[f'train/loss_tbin_{b}'] = float(tbin[b])
             wandb.log(log, step=step)
+
+        if step % FLAGS.perf_log_interval == 0 and jax.process_index() == 0:
+            wandb.log({
+                'perf/data_time': data_time,
+                'perf/vae_time': vae_time,
+                'perf/train_step_time': step_time,
+                'perf/total_iter_time': dt_step,
+            }, step=step)
 
         # ── Eval ──
         if step % FLAGS.eval_interval == 0 or step == 1000:

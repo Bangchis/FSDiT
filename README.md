@@ -60,6 +60,9 @@ import os; os.chdir('/kaggle/working/FSDiT')
     --save_dir /kaggle/working/ckpts \
     --batch_size 128 \
     --max_steps 200000 \
+    --use_support_seq=1 \
+    --perf_log_interval=100 \
+    --suppress_diffusers_warnings=1 \
     --wandb.name fsdit_run1
 ```
 
