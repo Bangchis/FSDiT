@@ -50,6 +50,10 @@ flags.DEFINE_string('data_dir', '/kaggle/input/datasets/arjunashok33/miniimagene
                     'miniImageNet root (contains train/, val/, test/).')
 flags.DEFINE_string('embeddings_dir', None,
                     'Optional root for precomputed embeddings (contains train/, val/, test/).')
+flags.DEFINE_string('episode_tfrecord_dir', None,
+                    'Optional TFRecord episode root with train/*.tfrecord and val/*.tfrecord.')
+flags.DEFINE_string('tfrecord_compression_type', 'GZIP',
+                    'Compression type for TFRecord episode shards ("", "GZIP").')
 flags.DEFINE_string('load_dir', None,  'Resume from checkpoint.')
 flags.DEFINE_string('save_dir', None,  'Save checkpoints here.')
 flags.DEFINE_string('fid_stats', None, 'Precomputed FID stats .npz.')
@@ -61,6 +65,7 @@ flags.DEFINE_integer('num_sets', 100, 'Sets per class (each set = 6 images).')
 flags.DEFINE_integer('debug_overfit', 0, 'Overfit on N samples (0 = off).')
 flags.DEFINE_bool('use_support_seq', True, 'Use support sequence context for cross-attention.')
 flags.DEFINE_bool('suppress_diffusers_warnings', True, 'Suppress repeated diffusers Flax deprecation warnings.')
+flags.DEFINE_integer('npz_cache_size', 2048, 'LRU cache size for support .npz files in dataset loader (0 to disable).')
 # Logging
 flags.DEFINE_integer('log_interval', 500, 'Train metric logging interval.')
 flags.DEFINE_integer('eval_interval', 5000, 'Validation + attention entropy interval.')
@@ -301,11 +306,20 @@ def main(_):
     local_bs = FLAGS.batch_size // (n_dev_global // n_dev)
     print(f"Devices: {n_dev} local / {n_dev_global} global")
     print(f"Batch: {FLAGS.batch_size} global / {local_bs} local / {local_bs // n_dev} per-device")
+    print(f"Support npz cache size: {FLAGS.npz_cache_size}")
+    if FLAGS.episode_tfrecord_dir:
+        print(f"Episode TFRecord mode: {FLAGS.episode_tfrecord_dir}")
 
     if jax.process_index() == 0:
         setup_wandb(cfg.to_dict(), **FLAGS.wandb)
 
     # ── Data ───────────────────────────────────────────────────────────────
+    train_pattern = None
+    val_pattern = None
+    if FLAGS.episode_tfrecord_dir:
+        train_pattern = os.path.join(FLAGS.episode_tfrecord_dir, 'train', 'train-*.tfrecord')
+        val_pattern = os.path.join(FLAGS.episode_tfrecord_dir, 'val', 'val-*.tfrecord')
+
     train_emb_dir = os.path.join(FLAGS.embeddings_dir, 'train') if FLAGS.embeddings_dir else None
     val_emb_dir = os.path.join(FLAGS.embeddings_dir, 'val') if FLAGS.embeddings_dir else None
 
@@ -315,6 +329,9 @@ def main(_):
         is_train=True, seed=FLAGS.seed, debug_n=FLAGS.debug_overfit,
         embedding_root=train_emb_dir,
         load_support_seq=FLAGS.use_support_seq,
+        npz_cache_size=FLAGS.npz_cache_size,
+        episode_tfrecord_pattern=train_pattern,
+        tfrecord_compression_type=FLAGS.tfrecord_compression_type,
     )
     val_ds, _ = build_dataset(
         os.path.join(FLAGS.data_dir, 'val'), local_bs,
@@ -322,6 +339,9 @@ def main(_):
         is_train=False, seed=FLAGS.seed + 1000,
         embedding_root=val_emb_dir,
         load_support_seq=FLAGS.use_support_seq,
+        npz_cache_size=max(FLAGS.npz_cache_size // 4, 0),
+        episode_tfrecord_pattern=val_pattern,
+        tfrecord_compression_type=FLAGS.tfrecord_compression_type,
     )
     train_iter = iter(train_ds.as_numpy_iterator())
     val_iter = iter(val_ds.as_numpy_iterator())

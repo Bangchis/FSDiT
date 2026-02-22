@@ -61,9 +61,34 @@ import os; os.chdir('/kaggle/working/FSDiT')
     --batch_size 128 \
     --max_steps 200000 \
     --use_support_seq=1 \
+    --npz_cache_size=2048 \
     --perf_log_interval=100 \
     --suppress_diffusers_warnings=1 \
     --wandb.name fsdit_run1
+
+# (Optional, faster & more stable input pipeline)
+# Build episode-level TFRecord shards (no tf.py_function in training input pipeline)
+!python build_episode_tfrecord.py \
+    --data_dir /kaggle/working/miniimagenet \
+    --embeddings_dir /kaggle/working/miniimagenet_npz \
+    --out_dir /kaggle/working/miniimagenet_tfrecord \
+    --splits train,val \
+    --num_sets 100 \
+    --num_shards 64 \
+    --store_seq 1 \
+    --compression GZIP
+
+# Train from TFRecord shards
+!python train.py \
+    --data_dir /kaggle/working/miniimagenet \
+    --episode_tfrecord_dir /kaggle/working/miniimagenet_tfrecord \
+    --save_dir /kaggle/working/ckpts \
+    --batch_size 128 \
+    --max_steps 200000 \
+    --use_support_seq=1 \
+    --perf_log_interval=100 \
+    --suppress_diffusers_warnings=1 \
+    --wandb.name fsdit_run_tfrecord
 ```
 
 ## Hyperparameters
