@@ -4,7 +4,10 @@ Smoke tests for FSDiT:
 2) DiT forward pass with and without sequence context.
 
 Usage:
-  python3 smoke_test.py --data_dir /path/to/miniimagenet_split --batch_size 2
+  python3 smoke_test.py \
+      --data_dir /path/to/miniimagenet_split \
+      --episode_tfrecord_dir /path/to/miniimagenet_tfrecord \
+      --batch_size 2
 """
 
 import argparse
@@ -27,18 +30,11 @@ def _resolve_train_dir(data_dir):
     return train_dir if os.path.isdir(train_dir) else data_dir
 
 
-def check_dataset_contract(
-    data_dir, embedding_root, episode_tfrecord_dir, batch_size, image_size, num_sets
-):
+def check_dataset_contract(data_dir, episode_tfrecord_dir, batch_size, image_size, num_sets):
     train_dir = _resolve_train_dir(data_dir)
-    train_emb_dir = None
-    if embedding_root:
-        train_emb_dir = os.path.join(embedding_root, "train")
-        if not os.path.isdir(train_emb_dir):
-            train_emb_dir = embedding_root
-    train_pattern = None
-    if episode_tfrecord_dir:
-        train_pattern = os.path.join(episode_tfrecord_dir, "train", "train-*.tfrecord")
+    if not episode_tfrecord_dir:
+        raise ValueError("TFRecord-only smoke test: please pass --episode_tfrecord_dir.")
+    train_pattern = os.path.join(episode_tfrecord_dir, "train", "train-*.tfrecord")
     ds, _ = build_dataset(
         train_dir,
         batch_size=batch_size,
@@ -47,7 +43,6 @@ def check_dataset_contract(
         is_train=False,
         seed=0,
         debug_n=max(batch_size * 2, 2),
-        embedding_root=train_emb_dir,
         episode_tfrecord_pattern=train_pattern,
         tfrecord_compression_type="GZIP",
     )
@@ -138,8 +133,7 @@ def check_model_forward(batch):
 def main():
     parser = argparse.ArgumentParser(description="Run FSDiT smoke tests.")
     parser.add_argument("--data_dir", required=True, help="miniImageNet split root or train folder.")
-    parser.add_argument("--embeddings_dir", default=None, help="Optional embedding root.")
-    parser.add_argument("--episode_tfrecord_dir", default=None, help="Optional episode TFRecord root.")
+    parser.add_argument("--episode_tfrecord_dir", required=True, help="Episode TFRecord root.")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--num_sets", type=int, default=1)
@@ -147,7 +141,6 @@ def main():
 
     batch = check_dataset_contract(
         args.data_dir,
-        args.embeddings_dir,
         args.episode_tfrecord_dir,
         args.batch_size,
         args.image_size,

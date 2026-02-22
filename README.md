@@ -6,7 +6,7 @@ for few-shot image generation on miniImageNet.
 ## Architecture
 
 ```
-5 Support Images → precompute `.npz` (seq[196,768], pooled[768])
+5 Support Images → precompute `.npz` (seq[196,768], pooled[768]) → build episode TFRecord shards
 pooled → MLP → adaLN condition
 seq    → OneLayerPerceiver → Cross-Attn context
 Target Image → [SD VAE] → latent → DiT (adaLN-Zero + cross-attn) → v_pred
@@ -53,21 +53,7 @@ import os; os.chdir('/kaggle/working/FSDiT')
     --batch_size 256 \
     --dtype float16
 
-# Cell 4: Train
-!python train.py \
-    --data_dir /kaggle/working/miniimagenet \
-    --embeddings_dir /kaggle/working/miniimagenet_npz \
-    --save_dir /kaggle/working/ckpts \
-    --batch_size 128 \
-    --max_steps 200000 \
-    --use_support_seq=1 \
-    --npz_cache_size=2048 \
-    --perf_log_interval=100 \
-    --suppress_diffusers_warnings=1 \
-    --wandb.name fsdit_run1
-
-# (Optional, faster & more stable input pipeline)
-# Build episode-level TFRecord shards (no tf.py_function in training input pipeline)
+# Cell 4: Build episode-level TFRecord shards
 !python build_episode_tfrecord.py \
     --data_dir /kaggle/working/miniimagenet \
     --embeddings_dir /kaggle/working/miniimagenet_npz \
@@ -78,7 +64,7 @@ import os; os.chdir('/kaggle/working/FSDiT')
     --store_seq 1 \
     --compression GZIP
 
-# Train from TFRecord shards
+# Cell 5: Train from TFRecord shards (runtime is TFRecord-only)
 !python train.py \
     --data_dir /kaggle/working/miniimagenet \
     --episode_tfrecord_dir /kaggle/working/miniimagenet_tfrecord \
@@ -109,15 +95,13 @@ import os; os.chdir('/kaggle/working/FSDiT')
 - 60 train / 16 val / 20 test classes, 600 images/class
 - 100 sets/class × 6 images/set × 6 rotations = **36,000 episodes**
 - Each episode: 1 target + 5 support, stratified batching
-- For each support image, a sidecar `.npz` file is required with:
-- You can store `.npz` either:
-  - next to source images (sidecar mode), or
-  - in a separate mirrored cache root via `--out_dir` + `--embeddings_dir`.
+- Runtime loader uses only episode TFRecord shards (`--episode_tfrecord_dir`).
+- `.npz` is an intermediate cache used only by `build_episode_tfrecord.py`.
 - For TPU throughput in precompute:
-  - keep `pmap` enabled (default),
-  - use larger `--batch_size` (e.g. 256/512 depending on memory).
+  - keep `pmap` enabled (default)
+  - use larger `--batch_size` (e.g. 256/512 depending on memory)
 - Image decode/resize runs on CPU (TensorFlow input pipeline), while SigLIP2 encode runs on JAX backend (TPU/GPU/CPU).
-- Each `.npz` file includes:
+- Each intermediate `.npz` file includes:
   - `seq`: `(196, 768)` (SigLIP2 patch tokens)
   - `pooled`: `(768,)` (SigLIP2 pooled embedding)
 
