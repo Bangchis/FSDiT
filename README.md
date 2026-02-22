@@ -50,6 +50,7 @@ import os; os.chdir('/kaggle/working/FSDiT')
 !python precompute_siglip_debug.py \
     --data_dir /kaggle/working/miniimagenet \
     --out_dir /kaggle/working/miniimagenet_npz \
+    --batch_size 256 \
     --dtype float16
 
 # Cell 4: Train
@@ -84,6 +85,10 @@ import os; os.chdir('/kaggle/working/FSDiT')
 - You can store `.npz` either:
   - next to source images (sidecar mode), or
   - in a separate mirrored cache root via `--out_dir` + `--embeddings_dir`.
+- For TPU throughput in precompute:
+  - keep `pmap` enabled (default),
+  - use larger `--batch_size` (e.g. 256/512 depending on memory).
+- Image decode/resize runs on CPU (TensorFlow input pipeline), while SigLIP2 encode runs on JAX backend (TPU/GPU/CPU).
 - Each `.npz` file includes:
   - `seq`: `(196, 768)` (SigLIP2 patch tokens)
   - `pooled`: `(768,)` (SigLIP2 pooled embedding)
