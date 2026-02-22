@@ -352,21 +352,40 @@ def main(_):
         depth=cfg.depth, num_heads=cfg.num_heads, mlp_ratio=cfg.mlp_ratio,
         siglip_dim=cfg.siglip_dim, cond_dropout_prob=cfg.cond_dropout,
     )
+    init_kwargs = {}
+    if FLAGS.use_support_seq:
+        init_kwargs['y_seq'] = jnp.zeros((1, n_sup_tokens, cfg.siglip_dim))
     params = dit.init(
         {'params': p_key, 'cond_dropout': d_key},
         jnp.zeros((1, img_s, img_s, img_c)),   # x
-        jnp.zeros((1,)),                         # t
-        jnp.zeros((1, cfg.siglip_dim)),          # y_pooled
-        jnp.zeros((1, n_sup_tokens, cfg.siglip_dim)),  # y_seq
+        jnp.zeros((1,)),                        # t
+        jnp.zeros((1, cfg.siglip_dim)),         # y_pooled
+        **init_kwargs,
     )['params']
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
     print(f"DiT parameters: {n_params:,}")
 
     # ── Optimizer: warmup → cosine decay + grad clip + AdamW ──────────────
-    warmup = optax.linear_schedule(0.0, cfg.lr, cfg.warmup_steps)
-    cosine = optax.cosine_decay_schedule(
-        cfg.lr, FLAGS.max_steps - cfg.warmup_steps, alpha=cfg.lr_min / cfg.lr)
-    lr_schedule = optax.join_schedules([warmup, cosine], [cfg.warmup_steps])
+    max_steps = int(FLAGS.max_steps)
+    warmup_steps = int(min(cfg.warmup_steps, max_steps))
+    if max_steps <= cfg.warmup_steps:
+        # Short benchmark runs: only warmup schedule (no cosine phase).
+        lr_schedule = optax.linear_schedule(
+            init_value=0.0,
+            end_value=cfg.lr,
+            transition_steps=max(max_steps, 1),
+        )
+        print(
+            f"[LR] warmup-only schedule: max_steps={max_steps} <= warmup_steps={cfg.warmup_steps}"
+        )
+    else:
+        warmup = optax.linear_schedule(0.0, cfg.lr, warmup_steps)
+        cosine = optax.cosine_decay_schedule(
+            cfg.lr,
+            max(max_steps - warmup_steps, 1),
+            alpha=cfg.lr_min / cfg.lr,
+        )
+        lr_schedule = optax.join_schedules([warmup, cosine], [warmup_steps])
 
     tx = optax.chain(
         optax.clip_by_global_norm(cfg.grad_clip),
