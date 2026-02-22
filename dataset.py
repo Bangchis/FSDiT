@@ -64,7 +64,7 @@ def _interleave_by_class(episodes, num_classes, seed):
 
 def build_dataset(
     data_dir, batch_size, image_size=224, num_sets=100,
-    is_train=True, seed=42, debug_n=0,
+    is_train=True, seed=42, debug_n=0, embedding_root=None,
 ):
     """
     Build tf.data pipeline for FSDiT training.
@@ -111,7 +111,11 @@ def build_dataset(
 
         def read_npz(path_tensor):
             path_str = path_tensor.numpy().decode('utf-8')
-            npz_path = os.path.splitext(path_str)[0] + '.npz'
+            if embedding_root:
+                rel = os.path.relpath(path_str, data_dir)
+                npz_path = os.path.join(embedding_root, os.path.splitext(rel)[0] + '.npz')
+            else:
+                npz_path = os.path.splitext(path_str)[0] + '.npz'
             if not os.path.exists(npz_path):
                 raise FileNotFoundError(f"Missing precomputed embedding: {npz_path}")
             data = np.load(npz_path)

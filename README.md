@@ -45,13 +45,17 @@ import os; os.chdir('/kaggle/working/FSDiT')
     --train 60 --val 16 --test 20
 
 # Cell 3: Precompute SigLIP2 embeddings
+# Recommended on Kaggle when /kaggle/working/miniimagenet uses symlinks to /kaggle/input:
+# store embeddings in a writable cache directory.
 !python precompute_siglip_debug.py \
     --data_dir /kaggle/working/miniimagenet \
+    --out_dir /kaggle/working/miniimagenet_npz \
     --dtype float16
 
 # Cell 4: Train
 !python train.py \
     --data_dir /kaggle/working/miniimagenet \
+    --embeddings_dir /kaggle/working/miniimagenet_npz \
     --save_dir /kaggle/working/ckpts \
     --batch_size 128 \
     --max_steps 200000 \
@@ -77,6 +81,10 @@ import os; os.chdir('/kaggle/working/FSDiT')
 - 100 sets/class × 6 images/set × 6 rotations = **36,000 episodes**
 - Each episode: 1 target + 5 support, stratified batching
 - For each support image, a sidecar `.npz` file is required with:
+- You can store `.npz` either:
+  - next to source images (sidecar mode), or
+  - in a separate mirrored cache root via `--out_dir` + `--embeddings_dir`.
+- Each `.npz` file includes:
   - `seq`: `(196, 768)` (SigLIP2 patch tokens)
   - `pooled`: `(768,)` (SigLIP2 pooled embedding)
 

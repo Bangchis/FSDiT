@@ -27,8 +27,13 @@ def _resolve_train_dir(data_dir):
     return train_dir if os.path.isdir(train_dir) else data_dir
 
 
-def check_dataset_contract(data_dir, batch_size, image_size, num_sets):
+def check_dataset_contract(data_dir, embedding_root, batch_size, image_size, num_sets):
     train_dir = _resolve_train_dir(data_dir)
+    train_emb_dir = None
+    if embedding_root:
+        train_emb_dir = os.path.join(embedding_root, "train")
+        if not os.path.isdir(train_emb_dir):
+            train_emb_dir = embedding_root
     ds, _ = build_dataset(
         train_dir,
         batch_size=batch_size,
@@ -37,6 +42,7 @@ def check_dataset_contract(data_dir, batch_size, image_size, num_sets):
         is_train=False,
         seed=0,
         debug_n=max(batch_size * 2, 2),
+        embedding_root=train_emb_dir,
     )
     batch = next(iter(ds.as_numpy_iterator()))
 
@@ -125,12 +131,19 @@ def check_model_forward(batch):
 def main():
     parser = argparse.ArgumentParser(description="Run FSDiT smoke tests.")
     parser.add_argument("--data_dir", required=True, help="miniImageNet split root or train folder.")
+    parser.add_argument("--embeddings_dir", default=None, help="Optional embedding root.")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--num_sets", type=int, default=1)
     args = parser.parse_args()
 
-    batch = check_dataset_contract(args.data_dir, args.batch_size, args.image_size, args.num_sets)
+    batch = check_dataset_contract(
+        args.data_dir,
+        args.embeddings_dir,
+        args.batch_size,
+        args.image_size,
+        args.num_sets,
+    )
     check_model_forward(batch)
     print("All smoke tests passed.")
 

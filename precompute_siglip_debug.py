@@ -28,7 +28,7 @@ def _is_image_file(name):
 
 def _collect_images(data_dir):
     paths = []
-    for root, _, files in os.walk(data_dir):
+    for root, _, files in os.walk(data_dir, followlinks=True):
         for fname in files:
             if _is_image_file(fname):
                 paths.append(os.path.join(root, fname))
@@ -57,6 +57,11 @@ def _validate_outputs(seq_embs, pooled_emb):
 def main():
     parser = argparse.ArgumentParser(description="Precompute SigLIP2 sequence+pooled embeddings.")
     parser.add_argument("--data_dir", required=True, help="Root folder containing class folders.")
+    parser.add_argument(
+        "--out_dir",
+        default=None,
+        help="Optional writable root for .npz cache. If unset, saves next to images.",
+    )
     parser.add_argument("--image_size", type=int, default=224, help="SigLIP resolution.")
     parser.add_argument("--variant", default="B/16", help="SigLIP2 vision variant.")
     parser.add_argument("--ckpt_path", default=None, help="Optional local SigLIP checkpoint .npz.")
@@ -92,7 +97,12 @@ def main():
     skipped = 0
     failed = 0
     for img_path in tqdm(image_paths, dynamic_ncols=True):
-        npz_path = os.path.splitext(img_path)[0] + ".npz"
+        if args.out_dir:
+            rel = os.path.relpath(img_path, args.data_dir)
+            npz_path = os.path.join(args.out_dir, os.path.splitext(rel)[0] + ".npz")
+            os.makedirs(os.path.dirname(npz_path), exist_ok=True)
+        else:
+            npz_path = os.path.splitext(img_path)[0] + ".npz"
         if os.path.exists(npz_path) and not args.overwrite:
             skipped += 1
             continue

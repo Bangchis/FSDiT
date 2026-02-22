@@ -47,6 +47,8 @@ FLAGS = flags.FLAGS
 # Paths
 flags.DEFINE_string('data_dir', '/kaggle/input/datasets/arjunashok33/miniimagenet',
                     'miniImageNet root (contains train/, val/, test/).')
+flags.DEFINE_string('embeddings_dir', None,
+                    'Optional root for precomputed embeddings (contains train/, val/, test/).')
 flags.DEFINE_string('load_dir', None,  'Resume from checkpoint.')
 flags.DEFINE_string('save_dir', None,  'Save checkpoints here.')
 flags.DEFINE_string('fid_stats', None, 'Precomputed FID stats .npz.')
@@ -280,14 +282,21 @@ def main(_):
         setup_wandb(cfg.to_dict(), **FLAGS.wandb)
 
     # ── Data ───────────────────────────────────────────────────────────────
+    train_emb_dir = os.path.join(FLAGS.embeddings_dir, 'train') if FLAGS.embeddings_dir else None
+    val_emb_dir = os.path.join(FLAGS.embeddings_dir, 'val') if FLAGS.embeddings_dir else None
+
     train_ds, train_cls = build_dataset(
         os.path.join(FLAGS.data_dir, 'train'), local_bs,
         image_size=cfg.image_size, num_sets=FLAGS.num_sets,
-        is_train=True, seed=FLAGS.seed, debug_n=FLAGS.debug_overfit)
+        is_train=True, seed=FLAGS.seed, debug_n=FLAGS.debug_overfit,
+        embedding_root=train_emb_dir,
+    )
     val_ds, _ = build_dataset(
         os.path.join(FLAGS.data_dir, 'val'), local_bs,
         image_size=cfg.image_size, num_sets=FLAGS.num_sets,
-        is_train=False, seed=FLAGS.seed + 1000)
+        is_train=False, seed=FLAGS.seed + 1000,
+        embedding_root=val_emb_dir,
+    )
     train_iter = iter(train_ds.as_numpy_iterator())
     val_iter = iter(val_ds.as_numpy_iterator())
 
