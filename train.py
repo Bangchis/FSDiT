@@ -64,12 +64,14 @@ flags.DEFINE_integer('num_sets', 100, 'Sets per class (each set = 6 images).')
 flags.DEFINE_integer('debug_overfit', 0, 'Overfit on N samples (0 = off).')
 flags.DEFINE_bool('use_support_seq', True, 'Use support sequence context for cross-attention.')
 flags.DEFINE_bool('suppress_diffusers_warnings', True, 'Suppress repeated diffusers Flax deprecation warnings.')
+flags.DEFINE_bool('log_model_debug', True, 'Log model activation/condition debug metrics.')
 # Logging
 flags.DEFINE_integer('log_interval', 500, 'Train metric logging interval.')
 flags.DEFINE_integer('eval_interval', 5000, 'Validation + attention entropy interval.')
 flags.DEFINE_integer('fid_interval', 25000, 'FID / sample grid interval.')
 flags.DEFINE_integer('save_interval', 25000, 'Checkpoint interval.')
 flags.DEFINE_integer('perf_log_interval', 100, 'Performance timing logging interval.')
+flags.DEFINE_integer('cond_hist_interval', 5000, 'Condition distribution histogram logging interval.')
 
 model_config = ml_collections.ConfigDict({
     # ── Optimizer ──
@@ -101,6 +103,7 @@ model_config = ml_collections.ConfigDict({
     'loss_ema_alpha': 0.99,  # EMA smoothing for logged train loss
     'num_t_bins': 10,        # t-bin resolution for loss breakdown
     'use_support_seq': 1,    # whether to use support sequence context
+    'log_model_debug': 1,    # return model debug tensors during training
 })
 
 PRESETS = {
@@ -144,6 +147,51 @@ def compute_t_bin_losses(loss_per_sample, t, num_bins):
     return bins
 
 
+def compute_condition_distribution_metrics(cond_vec, class_ids):
+    """
+    Numpy metrics for SigLIP pooled-condition distribution in a batch.
+    Returns:
+      metrics: scalar dict
+      same_vals: cosine values for same-class pairs
+      diff_vals: cosine values for diff-class pairs
+    """
+    x = np.asarray(cond_vec, dtype=np.float32)
+    y = np.asarray(class_ids, dtype=np.int32).reshape(-1)
+    if x.ndim != 2 or x.shape[0] != y.shape[0]:
+        return {}, np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+
+    bsz = x.shape[0]
+    metrics = {
+        'cond/support_pooled_abs_mean': float(np.mean(np.abs(x))),
+        'cond/support_pooled_l2_mean': float(np.mean(np.linalg.norm(x, axis=-1))),
+        'cond/support_pooled_dim_std_mean': float(np.mean(np.std(x, axis=0))),
+    }
+
+    if bsz < 2:
+        metrics['cond/same_class_pair_ratio'] = 0.0
+        metrics['cond/same_class_cos_mean'] = 0.0
+        metrics['cond/same_class_cos_std'] = 0.0
+        metrics['cond/diff_class_cos_mean'] = 0.0
+        metrics['cond/diff_class_cos_std'] = 0.0
+        return metrics, np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+
+    x_norm = x / np.maximum(np.linalg.norm(x, axis=-1, keepdims=True), 1e-6)
+    cos = x_norm @ x_norm.T
+    same = (y[:, None] == y[None, :])
+    iu = np.triu_indices(bsz, 1)
+    cos_u = cos[iu]
+    same_u = same[iu]
+    same_vals = cos_u[same_u]
+    diff_vals = cos_u[~same_u]
+    num_pairs = float(cos_u.shape[0])
+    metrics['cond/same_class_pair_ratio'] = float(same_vals.shape[0] / max(num_pairs, 1.0))
+    metrics['cond/same_class_cos_mean'] = float(np.mean(same_vals)) if same_vals.size else 0.0
+    metrics['cond/same_class_cos_std'] = float(np.std(same_vals)) if same_vals.size else 0.0
+    metrics['cond/diff_class_cos_mean'] = float(np.mean(diff_vals)) if diff_vals.size else 0.0
+    metrics['cond/diff_class_cos_std'] = float(np.std(diff_vals)) if diff_vals.size else 0.0
+    return metrics, same_vals.astype(np.float32), diff_vals.astype(np.float32)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  FSDiT Trainer (PyTreeNode — compatible with pmap/jit)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -173,10 +221,17 @@ class Trainer(flax.struct.PyTreeNode):
             v_gt = flow_velocity(images, eps)
             sup_pooled = support_pooled.astype(images.dtype)
             sup_seq = support_seq.astype(images.dtype) if self.config.get('use_support_seq', 1) else None
-            v_pred = self.model(
-                x_t, t, sup_pooled, y_seq=sup_seq, train=True,
-                rngs={'cond_dropout': cond_key}, params=params,
-            )
+            if self.config.get('log_model_debug', 1):
+                v_pred, dbg = self.model(
+                    x_t, t, sup_pooled, y_seq=sup_seq, train=True,
+                    return_debug=True, rngs={'cond_dropout': cond_key}, params=params,
+                )
+            else:
+                v_pred = self.model(
+                    x_t, t, sup_pooled, y_seq=sup_seq, train=True,
+                    rngs={'cond_dropout': cond_key}, params=params,
+                )
+                dbg = None
             mse = (v_pred - v_gt) ** 2
             loss = jnp.mean(mse)
 
@@ -184,12 +239,24 @@ class Trainer(flax.struct.PyTreeNode):
             loss_ps = jnp.mean(mse, axis=(1, 2, 3))
             tbin = compute_t_bin_losses(loss_ps, t, num_bins)
 
-            return loss, {
+            info = {
                 'loss': loss,
                 'v_abs': jnp.abs(v_gt).mean(),
                 'v_pred_abs': jnp.abs(v_pred).mean(),
                 'tbin_loss': tbin,
             }
+            if dbg is not None:
+                info.update({
+                    'dbg/t_emb_abs_mean': dbg['t_emb_abs_mean'],
+                    'dbg/y_emb_abs_mean': dbg['y_emb_abs_mean'],
+                    'dbg/c_abs_mean': dbg['c_abs_mean'],
+                    'dbg/c_l2_mean': dbg['c_l2_mean'],
+                    'dbg/support_pooled_abs_mean': dbg['support_pooled_abs_mean'],
+                    'dbg/support_pooled_l2_mean': dbg['support_pooled_l2_mean'],
+                    'dbg/act_abs_per_layer': dbg['act_abs_per_layer'],
+                    'dbg/act_rms_per_layer': dbg['act_rms_per_layer'],
+                })
+            return loss, info
 
         grads, info = jax.grad(loss_fn, has_aux=True)(self.model.params)
         grads = jax.lax.pmean(grads, axis_name='data')
@@ -290,6 +357,7 @@ def main(_):
     for k, v in PRESETS[cfg.preset].items():
         cfg[k] = v
     cfg.use_support_seq = int(FLAGS.use_support_seq)
+    cfg.log_model_debug = int(FLAGS.log_model_debug)
 
     if FLAGS.suppress_diffusers_warnings:
         warnings.filterwarnings(
@@ -427,6 +495,12 @@ def main(_):
     def run_eval(step):
         val_batch = next(val_iter)
         val_img = val_batch['target']
+        val_class_ids = val_batch['class_id'].astype(np.int32)
+        val_sup_pooled_global = np.mean(
+            val_batch['supports_pooled'],
+            axis=1,
+            dtype=np.float32,
+        )
         val_sup_pooled = np.mean(
             val_batch['supports_pooled'],
             axis=1,
@@ -459,6 +533,19 @@ def main(_):
             log = {'val/loss': v_loss_f, 'val/train_val_gap': gap}
             for b in range(cfg.num_t_bins):
                 log[f'val/loss_tbin_{b}'] = float(v_tbin_f[b])
+            cond_metrics, same_vals, diff_vals = compute_condition_distribution_metrics(
+                val_sup_pooled_global, val_class_ids
+            )
+            for k, v in cond_metrics.items():
+                log[f'val_{k}'] = v
+            if step % FLAGS.cond_hist_interval == 0:
+                log['val_cond/support_pooled_hist'] = wandb.Histogram(
+                    val_sup_pooled_global.reshape(-1)
+                )
+                if same_vals.size:
+                    log['val_cond/same_class_cos_hist'] = wandb.Histogram(same_vals)
+                if diff_vals.size:
+                    log['val_cond/diff_class_cos_hist'] = wandb.Histogram(diff_vals)
             wandb.log(log, step=step)
 
         # Attention entropy
@@ -519,6 +606,8 @@ def main(_):
     print(f"{'═' * 60}\n")
 
     alpha = cfg.loss_ema_alpha
+    sup_pooled_global = None
+    class_ids_global = None
     for step in tqdm.tqdm(range(1, FLAGS.max_steps + 1), smoothing=0.1, dynamic_ncols=True):
         iter_t0 = time.time()
         data_time = 0.0
@@ -529,6 +618,12 @@ def main(_):
             t_data0 = time.time()
             batch = next(train_iter)
             imgs = batch['target']
+            class_ids_global = batch['class_id'].astype(np.int32)
+            sup_pooled_global = np.mean(
+                batch['supports_pooled'],
+                axis=1,
+                dtype=np.float32,
+            )
             sup_pooled = np.mean(
                 batch['supports_pooled'],
                 axis=1,
@@ -574,6 +669,37 @@ def main(_):
             tbin = np.array(info['tbin_loss']).mean(axis=0)
             for b in range(cfg.num_t_bins):
                 log[f'train/loss_tbin_{b}'] = float(tbin[b])
+
+            if FLAGS.log_model_debug:
+                log['dbg/t_emb_abs_mean'] = float(np.array(info['dbg/t_emb_abs_mean']).mean())
+                log['dbg/y_emb_abs_mean'] = float(np.array(info['dbg/y_emb_abs_mean']).mean())
+                log['dbg/c_abs_mean'] = float(np.array(info['dbg/c_abs_mean']).mean())
+                log['dbg/c_l2_mean'] = float(np.array(info['dbg/c_l2_mean']).mean())
+                log['dbg/support_pooled_abs_mean_model'] = float(
+                    np.array(info['dbg/support_pooled_abs_mean']).mean()
+                )
+                log['dbg/support_pooled_l2_mean_model'] = float(
+                    np.array(info['dbg/support_pooled_l2_mean']).mean()
+                )
+                act_abs = np.array(info['dbg/act_abs_per_layer']).mean(axis=0)
+                act_rms = np.array(info['dbg/act_rms_per_layer']).mean(axis=0)
+                for li in range(cfg.depth):
+                    log[f'act/layer{li}_abs_mean'] = float(act_abs[li])
+                    log[f'act/layer{li}_rms'] = float(act_rms[li])
+
+            if sup_pooled_global is not None and class_ids_global is not None:
+                cond_metrics, same_vals, diff_vals = compute_condition_distribution_metrics(
+                    sup_pooled_global, class_ids_global
+                )
+                log.update(cond_metrics)
+                if step % FLAGS.cond_hist_interval == 0:
+                    log['cond/support_pooled_hist'] = wandb.Histogram(
+                        sup_pooled_global.reshape(-1)
+                    )
+                    if same_vals.size:
+                        log['cond/same_class_cos_hist'] = wandb.Histogram(same_vals)
+                    if diff_vals.size:
+                        log['cond/diff_class_cos_hist'] = wandb.Histogram(diff_vals)
             wandb.log(log, step=step)
 
         if step % FLAGS.perf_log_interval == 0 and jax.process_index() == 0:

@@ -335,7 +335,7 @@ class DiT(nn.Module):
     @nn.compact
     def __call__(
         self, x, t, y_pooled, y_seq=None,
-        train=False, force_drop_ids=None, return_attn=False
+        train=False, force_drop_ids=None, return_attn=False, return_debug=False
     ):
         """
         x: (B, H, W, C)   noisy image / latent
@@ -368,6 +368,27 @@ class DiT(nn.Module):
                 self.class_dropout_prob, self.num_classes, self.hidden_size
             )(y_pooled, train=train, force_drop_ids=force_drop_ids)
         c = t_emb + y_emb
+
+        debug = None
+        act_abs = []
+        act_rms = []
+        if return_debug:
+            c_f32 = c.astype(jnp.float32)
+            t_f32 = t_emb.astype(jnp.float32)
+            y_f32 = y_emb.astype(jnp.float32)
+            debug = {
+                "t_emb_abs_mean": jnp.mean(jnp.abs(t_f32)),
+                "y_emb_abs_mean": jnp.mean(jnp.abs(y_f32)),
+                "c_abs_mean": jnp.mean(jnp.abs(c_f32)),
+                "c_l2_mean": jnp.mean(jnp.linalg.norm(c_f32, axis=-1)),
+            }
+            if self.siglip_dim > 0 and hasattr(y_pooled, "ndim") and y_pooled.ndim == 2:
+                yp = y_pooled.astype(jnp.float32)
+                debug["support_pooled_abs_mean"] = jnp.mean(jnp.abs(yp))
+                debug["support_pooled_l2_mean"] = jnp.mean(jnp.linalg.norm(yp, axis=-1))
+            else:
+                debug["support_pooled_abs_mean"] = jnp.array(0.0, dtype=jnp.float32)
+                debug["support_pooled_l2_mean"] = jnp.array(0.0, dtype=jnp.float32)
 
         context = None
         if y_seq is not None:
@@ -402,6 +423,10 @@ class DiT(nn.Module):
             else:
                 x = DiTBlock(self.hidden_size, self.num_heads,
                              self.mlp_ratio)(x, c, context=context)
+            if return_debug:
+                x_f32 = x.astype(jnp.float32)
+                act_abs.append(jnp.mean(jnp.abs(x_f32)))
+                act_rms.append(jnp.sqrt(jnp.mean(jnp.square(x_f32))))
 
         # Unpatchify
         x = FinalLayer(ps, C_out, self.hidden_size)(x, c)
@@ -409,4 +434,14 @@ class DiT(nn.Module):
         x = jnp.einsum('bhwpqc->bhpwqc', x)
         x = rearrange(x, 'B H P W Q C -> B (H P) (W Q) C')
 
-        return (x, attn_list) if return_attn else x
+        if return_debug:
+            debug["act_abs_per_layer"] = jnp.stack(act_abs)
+            debug["act_rms_per_layer"] = jnp.stack(act_rms)
+
+        if return_attn and return_debug:
+            return x, attn_list, debug
+        if return_attn:
+            return x, attn_list
+        if return_debug:
+            return x, debug
+        return x
