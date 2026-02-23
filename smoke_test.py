@@ -115,6 +115,7 @@ def build_condition(batch, data_mode, image_size, use_support_seq, online_cache_
         cache_items=online_cache_items,
         batch_size=online_siglip_batch_size,
         no_pmap=online_siglip_no_pmap,
+        warmup_need_seq=use_support_seq,
     )
     pooled, seq, stats = enc.encode_paths(batch["support_paths"][:bsz], need_seq=use_support_seq)
     _, _, stats2 = enc.encode_paths(batch["support_paths"][:bsz], need_seq=use_support_seq)

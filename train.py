@@ -29,6 +29,15 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+# Suppress noisy diffusers/flax deprecation warnings emitted during module import.
+warnings.filterwarnings(
+    "ignore",
+    message=".*Flax classes are deprecated and will be removed in Diffusers.*",
+    category=FutureWarning,
+)
+os.environ.setdefault("DIFFUSERS_VERBOSITY", "error")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
 from model import DiT
 from dataset import build_dataset
 from utils.train_state import TrainState, target_update
@@ -425,6 +434,7 @@ def main(_):
             cache_items=FLAGS.online_cache_items,
             batch_size=FLAGS.online_siglip_batch_size,
             no_pmap=FLAGS.online_siglip_no_pmap,
+            warmup_need_seq=bool(FLAGS.use_support_seq),
         )
 
     example = next(train_iter)
