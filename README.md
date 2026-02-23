@@ -1,14 +1,16 @@
 # FSDiT — Few-Shot Diffusion Transformer
 
-Flow-matching DiT conditioned on **precomputed SigLIP2 support embeddings** (pooled + token sequence)
-for few-shot image generation on miniImageNet.
+Flow-matching DiT conditioned on SigLIP2 support embeddings for few-shot image generation
+on miniImageNet.
+
+Default runtime now uses **online SigLIP conditioning** (no embedding cache required on disk).
 
 ## Architecture
 
 ```
-5 Support Images → precompute `.npz` (seq[196,768], pooled[768]) → build episode TFRecord shards
+5 Support Image Paths → Online SigLIP2 encoder (+ LRU cache)
 pooled → MLP → adaLN condition
-seq    → OneLayerPerceiver → Cross-Attn context
+seq    → OneLayerPerceiver → Cross-Attn context (optional with `--use_support_seq=1`)
 Target Image → [SD VAE] → latent → DiT (adaLN-Zero + cross-attn) → v_pred
 ```
 
@@ -20,6 +22,7 @@ FSDiT/
 ├── model.py          # DiT architecture + SupportProjector
 ├── dataset.py        # miniImageNet episode loader
 ├── encoder.py        # Frozen SigLIP2 B/16 encoder
+├── utils/online_support_encoder.py # Runtime SigLIP encoder + LRU cache
 ├── precompute_siglip_debug.py  # Precompute seq/pooled embeddings to .npz
 └── utils/
     ├── train_state.py
@@ -44,38 +47,28 @@ import os; os.chdir('/kaggle/working/FSDiT')
     --dst /kaggle/working/miniimagenet \
     --train 60 --val 16 --test 20
 
-# Cell 3: Precompute SigLIP2 embeddings
-# Recommended on Kaggle when /kaggle/working/miniimagenet uses symlinks to /kaggle/input:
-# store embeddings in a writable cache directory.
-!python precompute_siglip_debug.py \
-    --data_dir /kaggle/working/miniimagenet \
-    --out_dir /kaggle/working/miniimagenet_npz \
-    --batch_size 256 \
-    --dtype float16
-
-# Cell 4: Build episode-level TFRecord shards
-!python build_episode_tfrecord.py \
-    --data_dir /kaggle/working/miniimagenet \
-    --embeddings_dir /kaggle/working/miniimagenet_npz \
-    --out_dir /kaggle/working/miniimagenet_tfrecord \
-    --splits train,val \
-    --num_sets 100 \
-    --num_shards 64 \
-    --store_seq 1 \
-    --compression GZIP
-
-# Cell 5: Train from TFRecord shards (runtime is TFRecord-only)
+# Cell 3: Train directly with online SigLIP conditioning (no TFRecord embedding shards)
 !python train.py \
     --data_dir /kaggle/working/miniimagenet \
-    --episode_tfrecord_dir /kaggle/working/miniimagenet_tfrecord \
+    --data_mode online \
     --save_dir /kaggle/working/ckpts \
     --batch_size 128 \
     --max_steps 200000 \
     --use_support_seq=1 \
+    --online_cache_items=1024 \
+    --online_siglip_batch_size=256 \
     --perf_log_interval=100 \
     --suppress_diffusers_warnings=1 \
-    --wandb.name fsdit_run_tfrecord
+    --wandb.name fsdit_online_siglip
 ```
+
+### TFRecord fallback (optional)
+
+Use this only when you explicitly want precomputed shard benchmarks:
+
+1. `precompute_siglip_debug.py`
+2. `build_episode_tfrecord.py`
+3. `train.py --data_mode tfrecord --episode_tfrecord_dir ...`
 
 ## Hyperparameters
 
@@ -95,8 +88,9 @@ import os; os.chdir('/kaggle/working/FSDiT')
 - 60 train / 16 val / 20 test classes, 600 images/class
 - 100 sets/class × 6 images/set × 6 rotations = **36,000 episodes**
 - Each episode: 1 target + 5 support, stratified batching
-- Runtime loader uses only episode TFRecord shards (`--episode_tfrecord_dir`).
-- `.npz` is an intermediate cache used only by `build_episode_tfrecord.py`.
+- `data_mode=online` (default): dataset yields `target + support_paths`, SigLIP is encoded in `train.py`.
+- `data_mode=tfrecord` (fallback): dataset reads precomputed episode shards (`--episode_tfrecord_dir`).
+- `.npz` cache is optional and used only for TFRecord export flow.
 - For TPU throughput in precompute:
   - keep `pmap` enabled (default)
   - use larger `--batch_size` (e.g. 256/512 depending on memory)

@@ -1,15 +1,10 @@
 """
 train.py — FSDiT: Few-Shot Diffusion Transformer Training.
 
-Flow-matching DiT conditioned on precomputed SigLIP2 support embeddings.
-Data: miniImageNet (60 train / 16 val classes, 600 imgs each).
-Episodes: 100 sets/class × 6 rotations → 1 target + 5 support.
-
-Usage (Kaggle TPU v5e-8):
-    python train.py --data_dir /kaggle/input/.../miniimagenet \
-                    --episode_tfrecord_dir /kaggle/working/miniimagenet_tfrecord \
-                    --save_dir /kaggle/working/ckpts \
-                    --batch_size 128 --max_steps 200000
+Flow-matching DiT conditioned on SigLIP2 support embeddings.
+Supports:
+  - online mode (default): dataset returns support_paths, SigLIP encoded at runtime
+  - tfrecord mode        : dataset returns precomputed support embeddings
 """
 
 from typing import Any
@@ -39,6 +34,7 @@ from dataset import build_dataset
 from utils.train_state import TrainState, target_update
 from utils.checkpoint import Checkpoint
 from utils.stable_vae import StableVAE
+from utils.online_support_encoder import OnlineSupportEncoder
 from utils.wandb_utils import setup_wandb, default_wandb_config
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -49,10 +45,18 @@ FLAGS = flags.FLAGS
 # Paths
 flags.DEFINE_string('data_dir', '/kaggle/input/datasets/arjunashok33/miniimagenet',
                     'miniImageNet root (contains train/, val/, test/).')
+flags.DEFINE_enum('data_mode', 'online', ['online', 'tfrecord'],
+                  'Data mode: online (support_paths + runtime SigLIP) or tfrecord.')
 flags.DEFINE_string('episode_tfrecord_dir', None,
                     'TFRecord episode root with train/*.tfrecord and val/*.tfrecord.')
 flags.DEFINE_string('tfrecord_compression_type', 'GZIP',
                     'Compression type for TFRecord episode shards ("", "GZIP").')
+flags.DEFINE_integer('online_cache_items', 1024,
+                     'Max LRU cache items for online support embeddings.')
+flags.DEFINE_integer('online_siglip_batch_size', 256,
+                     'Mini-batch size for online SigLIP encoding.')
+flags.DEFINE_bool('online_siglip_no_pmap', False,
+                  'Disable pmap for online SigLIP encoding.')
 flags.DEFINE_string('load_dir', None,  'Resume from checkpoint.')
 flags.DEFINE_string('save_dir', None,  'Save checkpoints here.')
 flags.DEFINE_string('fid_stats', None, 'Precomputed FID stats .npz.')
@@ -372,25 +376,32 @@ def main(_):
     local_bs = FLAGS.batch_size // (n_dev_global // n_dev)
     print(f"Devices: {n_dev} local / {n_dev_global} global")
     print(f"Batch: {FLAGS.batch_size} global / {local_bs} local / {local_bs // n_dev} per-device")
-    if not FLAGS.episode_tfrecord_dir:
-        raise ValueError(
-            "TFRecord-only training: please set --episode_tfrecord_dir "
-            "(expected train/*.tfrecord and val/*.tfrecord)."
-        )
-    print(f"Episode TFRecord root: {FLAGS.episode_tfrecord_dir}")
+    if FLAGS.data_mode == 'tfrecord':
+        if not FLAGS.episode_tfrecord_dir:
+            raise ValueError(
+                "When --data_mode=tfrecord, please set --episode_tfrecord_dir "
+                "(expected train/*.tfrecord and val/*.tfrecord)."
+            )
+        print(f"Data mode: tfrecord ({FLAGS.episode_tfrecord_dir})")
+    else:
+        print("Data mode: online (support_paths + runtime SigLIP)")
 
     if jax.process_index() == 0:
         setup_wandb(cfg.to_dict(), **FLAGS.wandb)
 
     # ── Data ───────────────────────────────────────────────────────────────
-    train_pattern = os.path.join(FLAGS.episode_tfrecord_dir, 'train', 'train-*.tfrecord')
-    val_pattern = os.path.join(FLAGS.episode_tfrecord_dir, 'val', 'val-*.tfrecord')
+    train_pattern = None
+    val_pattern = None
+    if FLAGS.data_mode == 'tfrecord':
+        train_pattern = os.path.join(FLAGS.episode_tfrecord_dir, 'train', 'train-*.tfrecord')
+        val_pattern = os.path.join(FLAGS.episode_tfrecord_dir, 'val', 'val-*.tfrecord')
 
     train_ds, _ = build_dataset(
         os.path.join(FLAGS.data_dir, 'train'), local_bs,
         image_size=cfg.image_size, num_sets=FLAGS.num_sets,
         is_train=True, seed=FLAGS.seed, debug_n=FLAGS.debug_overfit,
         load_support_seq=FLAGS.use_support_seq,
+        data_mode=FLAGS.data_mode,
         episode_tfrecord_pattern=train_pattern,
         tfrecord_compression_type=FLAGS.tfrecord_compression_type,
     )
@@ -399,16 +410,29 @@ def main(_):
         image_size=cfg.image_size, num_sets=FLAGS.num_sets,
         is_train=False, seed=FLAGS.seed + 1000,
         load_support_seq=FLAGS.use_support_seq,
+        data_mode=FLAGS.data_mode,
         episode_tfrecord_pattern=val_pattern,
         tfrecord_compression_type=FLAGS.tfrecord_compression_type,
     )
     train_iter = iter(train_ds.as_numpy_iterator())
     val_iter = iter(val_ds.as_numpy_iterator())
 
+    online_encoder = None
+    if FLAGS.data_mode == 'online':
+        online_encoder = OnlineSupportEncoder(
+            variant='B/16',
+            image_size=cfg.image_size,
+            cache_items=FLAGS.online_cache_items,
+            batch_size=FLAGS.online_siglip_batch_size,
+            no_pmap=FLAGS.online_siglip_no_pmap,
+        )
+
     example = next(train_iter)
     example_img = example['target'][:1]  # (1, 224, 224, 3)
-    example_sup_seq = example['supports_seq'][:1]  # (1, 5, 196, 768)
-    n_sup_tokens = example_sup_seq.shape[1] * example_sup_seq.shape[2]
+    n_sup_tokens = 5 * 196
+    if FLAGS.data_mode == 'tfrecord':
+        example_sup_seq = example['supports_seq'][:1]  # (1, 5, 196, 768)
+        n_sup_tokens = example_sup_seq.shape[1] * example_sup_seq.shape[2]
 
     # ── VAE (optional) ────────────────────────────────────────────────────
     if cfg.use_vae:
@@ -491,30 +515,43 @@ def main(_):
             img = vae_decode(img[None])[0]
         return np.array(jnp.clip(img * 0.5 + 0.5, 0, 1))
 
+    def prepare_support_condition(batch):
+        """
+        Returns:
+          pooled_global: (B,768) float32 (for stats)
+          pooled_model : (B,768) float16 (for model input)
+          seq_model    : (B,T,768) float16 (for model input)
+          siglip_stats : dict or None
+        """
+        siglip_stats = None
+        if FLAGS.data_mode == 'online':
+            pooled_5, seq_5, siglip_stats = online_encoder.encode_paths(
+                batch['support_paths'],
+                need_seq=bool(FLAGS.use_support_seq),
+            )
+        else:
+            pooled_5 = batch['supports_pooled']
+            seq_5 = batch['supports_seq'] if FLAGS.use_support_seq else None
+
+        pooled_global = np.mean(pooled_5, axis=1, dtype=np.float32)
+        pooled_model = pooled_global.astype(np.float16)
+        if FLAGS.use_support_seq:
+            seq_model = seq_5.reshape(seq_5.shape[0], -1, seq_5.shape[-1]).astype(np.float16)
+        else:
+            seq_model = np.zeros(
+                (batch['target'].shape[0], 1, cfg.siglip_dim),
+                dtype=np.float16,
+            )
+        return pooled_global, pooled_model, seq_model, siglip_stats
+
     # ── Eval function ─────────────────────────────────────────────────────
     def run_eval(step):
         val_batch = next(val_iter)
         val_img = val_batch['target']
         val_class_ids = val_batch['class_id'].astype(np.int32)
-        val_sup_pooled_global = np.mean(
-            val_batch['supports_pooled'],
-            axis=1,
-            dtype=np.float32,
+        val_sup_pooled_global, val_sup_pooled, val_sup_seq, val_siglip_stats = (
+            prepare_support_condition(val_batch)
         )
-        val_sup_pooled = np.mean(
-            val_batch['supports_pooled'],
-            axis=1,
-            dtype=np.float32,
-        ).astype(np.float16)
-        if FLAGS.use_support_seq:
-            val_sup_seq = val_batch['supports_seq'].reshape(
-                val_batch['supports_seq'].shape[0], -1, val_batch['supports_seq'].shape[-1]
-            )
-        else:
-            val_sup_seq = np.zeros(
-                (val_batch['target'].shape[0], 1, cfg.siglip_dim),
-                dtype=np.float16,
-            )
 
         # Reshape for pmap
         val_img = val_img.reshape(n_dev, -1, *val_img.shape[1:])
@@ -538,6 +575,13 @@ def main(_):
             )
             for k, v in cond_metrics.items():
                 log[f'val_{k}'] = v
+            if FLAGS.data_mode == 'online' and val_siglip_stats is not None:
+                log['val_perf/siglip_encode_time'] = float(val_siglip_stats['encode_time'])
+                log['val_perf/siglip_cache_hit_rate'] = float(val_siglip_stats['cache_hit_rate'])
+                log['val_perf/siglip_cache_items'] = float(val_siglip_stats['cache_items'])
+                log['val_perf/siglip_unique_paths_per_batch'] = float(
+                    val_siglip_stats['unique_paths_per_batch']
+                )
             if step % FLAGS.cond_hist_interval == 0:
                 log['val_cond/support_pooled_hist'] = wandb.Histogram(
                     val_sup_pooled_global.reshape(-1)
@@ -611,34 +655,27 @@ def main(_):
     for step in tqdm.tqdm(range(1, FLAGS.max_steps + 1), smoothing=0.1, dynamic_ncols=True):
         iter_t0 = time.time()
         data_time = 0.0
+        siglip_time = 0.0
+        siglip_stats = None
         vae_time = 0.0
 
         # ── Get batch ──
         if not FLAGS.debug_overfit or step == 1:
             t_data0 = time.time()
             batch = next(train_iter)
+            data_time = time.time() - t_data0
+
             imgs = batch['target']
             class_ids_global = batch['class_id'].astype(np.int32)
-            sup_pooled_global = np.mean(
-                batch['supports_pooled'],
-                axis=1,
-                dtype=np.float32,
-            )
-            sup_pooled = np.mean(
-                batch['supports_pooled'],
-                axis=1,
-                dtype=np.float32,
-            ).astype(np.float16)
-            if FLAGS.use_support_seq:
-                sup_seq = batch['supports_seq'].reshape(
-                    batch['supports_seq'].shape[0], -1, batch['supports_seq'].shape[-1]
-                )
-            else:
-                sup_seq = np.zeros((batch['target'].shape[0], 1, cfg.siglip_dim), dtype=np.float16)
+            t_sig0 = time.time()
+            sup_pooled_global, sup_pooled, sup_seq, siglip_stats = prepare_support_condition(batch)
+            siglip_time = time.time() - t_sig0
+            if siglip_stats is not None:
+                siglip_time = float(siglip_stats['encode_time'])
+
             imgs = imgs.reshape(n_dev, -1, *imgs.shape[1:])
             sup_seq = sup_seq.reshape(n_dev, -1, *sup_seq.shape[1:])
             sup_pooled = sup_pooled.reshape(n_dev, -1, sup_pooled.shape[-1])
-            data_time = time.time() - t_data0
             if cfg.use_vae:
                 t_vae0 = time.time()
                 imgs = vae_encode(vae_rng, imgs)
@@ -703,12 +740,20 @@ def main(_):
             wandb.log(log, step=step)
 
         if step % FLAGS.perf_log_interval == 0 and jax.process_index() == 0:
-            wandb.log({
+            perf_log = {
                 'perf/data_time': data_time,
+                'perf/siglip_encode_time': siglip_time,
                 'perf/vae_time': vae_time,
                 'perf/train_step_time': step_time,
                 'perf/total_iter_time': dt_step,
-            }, step=step)
+            }
+            if FLAGS.data_mode == 'online' and siglip_stats is not None:
+                perf_log['perf/siglip_cache_hit_rate'] = float(siglip_stats['cache_hit_rate'])
+                perf_log['perf/siglip_cache_items'] = float(siglip_stats['cache_items'])
+                perf_log['perf/siglip_unique_paths_per_batch'] = float(
+                    siglip_stats['unique_paths_per_batch']
+                )
+            wandb.log(perf_log, step=step)
 
         # ── Eval ──
         if step % FLAGS.eval_interval == 0 or step == 1000:
